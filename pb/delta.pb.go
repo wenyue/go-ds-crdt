@@ -7,10 +7,11 @@
 package pb
 
 import (
-	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
-	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 	reflect "reflect"
 	sync "sync"
+
+	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
+	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
 )
 
 const (
@@ -28,6 +29,8 @@ type Delta struct {
 	Elements   []*Element `protobuf:"bytes,1,rep,name=elements,proto3" json:"elements,omitempty"`
 	Tombstones []*Element `protobuf:"bytes,2,rep,name=tombstones,proto3" json:"tombstones,omitempty"`
 	Priority   uint64     `protobuf:"varint,3,opt,name=priority,proto3" json:"priority,omitempty"`
+	PeerID     string     `protobuf:"bytes,4,opt,name=peerID,proto3" json:"peerID,omitempty"`
+	Signature  []byte      `protobuf:"bytes,5,opt,name=signature,proto3" json:"signature,omitempty"`
 }
 
 func (x *Delta) Reset() {
@@ -79,6 +82,20 @@ func (x *Delta) GetPriority() uint64 {
 		return x.Priority
 	}
 	return 0
+}
+
+func (x *Delta) GetPeerID() string {
+	if x != nil {
+		return x.PeerID
+	}
+	return ""
+}
+
+func (x *Delta) GetSignature() []byte {
+	if x != nil {
+		return x.Signature
+	}
+	return nil
 }
 
 type Element struct {

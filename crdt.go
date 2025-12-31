@@ -36,6 +36,8 @@ import (
 	query "github.com/ipfs/go-datastore/query"
 	ipld "github.com/ipfs/go-ipld-format"
 	logging "github.com/ipfs/go-log/v2"
+	"github.com/libp2p/go-libp2p/core/crypto"
+	"github.com/libp2p/go-libp2p/core/peer"
 )
 
 var _ ds.Datastore = (*Datastore)(nil)
@@ -107,6 +109,12 @@ type Options struct {
 	// branching is not necessarily a bad thing and may improve
 	// throughput, but everything depends on usage.
 	MultiHeadProcessing bool
+	// PrivateKey is the private key bytes for signing Delta messages (optional).
+	PrivateKey []byte
+	// RequireSignatureVerification specifies whether signature verification is required.
+	// If true, deltas with invalid signatures will be rejected.
+	// If false, signature verification failures will be logged as warnings but processing will continue.
+	RequireSignatureVerification bool
 }
 
 func (opts *Options) verify() error {
@@ -182,6 +190,9 @@ type Datastore struct {
 
 	curDeltaMux sync.Mutex
 	curDelta    *pb.Delta // current, unpublished delta
+
+	// Signing information (set during initialization, never modified).
+	privateKey []byte
 
 	wg sync.WaitGroup
 
@@ -281,6 +292,7 @@ func New(
 		dagService:     dagSyncer,
 		broadcaster:    bcast,
 		seenHeads:      make(map[cid.Cid]struct{}),
+		privateKey:     opts.PrivateKey,
 		jobQueue:       make(chan *dagJob, opts.NumWorkers),
 		sendJobs:       make(chan *dagJob),
 		queuedChildren: newCidSafeSet(),
@@ -683,6 +695,14 @@ loop:
 			err = fmt.Errorf("error getting delta: %w", deltaOpt.err)
 			break
 		}
+
+		// Verify signature if present.
+		if verifyErr := store.verifyDeltaSignature(deltaOpt.delta); verifyErr != nil {
+			store.logger.Errorf("signature verification failed for delta from node %s: %v, skipping", deltaOpt.node.Cid(), verifyErr)
+			// Skip this delta, don't add it to goodDeltas.
+			continue
+		}
+
 		goodDeltas[deltaOpt.node.Cid()] = struct{}{}
 
 		session.Add(1)
@@ -785,6 +805,8 @@ func (store *Datastore) MarkClean(ctx context.Context) {
 
 // processNode merges the delta in a node and has the logic about what to do
 // then.
+// Note: Signature verification for remote nodes is done in sendNewJobs before
+// queuing jobs. Local nodes (created by this instance) don't need verification.
 func (store *Datastore) processNode(ctx context.Context, ng *crdtNodeGetter, root cid.Cid, rootPrio uint64, delta *pb.Delta, node ipld.Node) ([]cid.Cid, error) {
 	// First,  merge the delta in this node.
 	current := node.Cid()
@@ -969,6 +991,14 @@ func (store *Datastore) repairDAG(ctx context.Context) error {
 			return fmt.Errorf("error getting node for reprocessing %s: %w", cur, err)
 		}
 		cancel()
+
+		// Verify signature if present.
+		if verifyErr := store.verifyDeltaSignature(delta); verifyErr != nil {
+			store.logger.Errorf("signature verification failed for delta from node %s during repair: %v, skipping untrusted branch", cur, verifyErr)
+			// Skip this node and all its children (untrusted branch).
+			atomic.AddUint64(&visitedNodes, 1)
+			continue
+		}
 
 		isProcessed, err := store.isProcessed(ctx, cur)
 		if err != nil {
@@ -1224,11 +1254,118 @@ func (store *Datastore) putBlock(ctx context.Context, heads []cid.Cid, height ui
 	return node, nil
 }
 
+// signDelta signs a Delta with peerID and privateKey if they are set.
+// It computes the hash of Delta content (excluding signature field) and signs it.
+func (store *Datastore) signDelta(delta *pb.Delta) error {
+	// If privateKey is not set, skip signing (backward compatibility).
+	if len(store.privateKey) == 0 {
+		return nil
+	}
+
+	// Unmarshal the private key using libp2p's crypto format.
+	privateKey, err := crypto.UnmarshalPrivateKey(store.privateKey)
+	if err != nil {
+		return fmt.Errorf("error unmarshaling private key: %w", err)
+	}
+
+	// Get the public key from the private key.
+	publicKey := privateKey.GetPublic()
+
+	// Create peer.ID from public key.
+	pid, err := peer.IDFromPublicKey(publicKey)
+	if err != nil {
+		return fmt.Errorf("error creating peer ID from public key: %w", err)
+	}
+
+	// Set peerID (as string) and clear signature for hashing.
+	delta.PeerID = pid.String()
+	delta.Signature = nil
+
+	// Marshal the delta (without signature) for signing.
+	data, err := proto.Marshal(delta)
+	if err != nil {
+		return fmt.Errorf("error marshaling delta for signing: %w", err)
+	}
+
+	// Sign the data using libp2p's crypto.
+	signature, err := privateKey.Sign(data)
+	if err != nil {
+		return fmt.Errorf("error signing delta: %w", err)
+	}
+
+	// Set signature in the delta.
+	delta.Signature = signature
+
+	return nil
+}
+
+// verifyDeltaSignature verifies the signature of a Delta message.
+// If both peerID and signature are present, the signature is verified.
+// If RequireSignatureVerification is true and verification fails, an error is returned.
+// If RequireSignatureVerification is false, verification failures are logged as warnings but processing continues.
+func (store *Datastore) verifyDeltaSignature(delta *pb.Delta) error {
+	peerIDStr := delta.GetPeerID()
+	signature := delta.GetSignature()
+
+	// Backward compatibility: if signature verification is not required and both peerID and signature are missing, allow the delta through without verification.
+	if !store.opts.RequireSignatureVerification && peerIDStr == "" && len(signature) == 0 {
+		return nil
+	}
+
+	// Check if signature data is complete.
+	if peerIDStr == "" || len(signature) == 0 {
+		return fmt.Errorf("delta has incomplete signature data: peerID=%q, signatureLen=%d", peerIDStr, len(signature))
+	}
+
+	// Parse and validate peerID.
+	pid, err := peer.Decode(peerIDStr)
+	if err != nil {
+		return fmt.Errorf("failed to decode peerID %q: %w", peerIDStr, err)
+	}
+
+	// Extract public key from peer.ID.
+	publicKey, err := pid.ExtractPublicKey()
+	if err != nil {
+		return fmt.Errorf("failed to extract public key from peerID %s: %w", pid, err)
+	}
+
+	// Temporarily clear signature for verification (same process as in signDelta).
+	// Use defer to ensure signature is restored even if an error occurs.
+	delta.Signature = nil
+	defer func() {
+		delta.Signature = signature
+	}()
+
+	// Marshal the delta (without signature) for verification.
+	data, err := proto.Marshal(delta)
+	if err != nil {
+		return fmt.Errorf("error marshaling delta for verification: %w", err)
+	}
+
+	// Verify the signature using libp2p's crypto.
+	valid, err := publicKey.Verify(data, signature)
+	if err != nil {
+		return fmt.Errorf("error verifying signature for peerID %s: %w", pid, err)
+	}
+
+	if !valid {
+		return fmt.Errorf("signature verification failed for delta with peerID=%s", pid)
+	}
+
+	return nil
+}
+
 func (store *Datastore) publish(ctx context.Context, delta *pb.Delta) error {
 	// curDelta might be nil if nothing has been added to it
 	if delta == nil {
 		return nil
 	}
+
+	// Sign the delta before publishing (if peerID and privateKey are set).
+	if err := store.signDelta(delta); err != nil {
+		return fmt.Errorf("error signing delta: %w", err)
+	}
+
 	c, err := store.addDAGNode(ctx, delta)
 	if err != nil {
 		return err

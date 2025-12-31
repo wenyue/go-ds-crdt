@@ -7,6 +7,10 @@ message Delta {
   repeated Element elements = 1;
   repeated Element tombstones = 2;
   uint64 priority = 3;
+  // PeerID identifies the creator of this Delta (peer ID).
+  string peerID = 4;
+  // Signature is a digital signature for verifying Delta integrity and authenticity.
+  bytes signature = 5;
 }
 
 message Element {
